@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>GP360 Biometric Bridge</title>
+    <meta charset="utf-8">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background: #f5f5f5;
+        }
+        .container {
+            text-align: center;
+            padding: 20px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+        }
+        .status {
+            margin: 20px 0;
+            padding: 15px;
+            background: #e3f2fd;
+            border-radius: 4px;
+            color: #1976d2;
+        }
+        .error {
+            background: #ffebee;
+            color: #c62828;
+        }
+        button {
+            margin: 10px;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            background: #1976d2;
+            color: white;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background: #1565c0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>GP360 Biometric Client</h1>
+        <div id="status" class="status">
+            Launching biometric client...
+        </div>
+        <button onclick="launchClient()">Retry Launch</button>
+        <button onclick="window.close()">Close</button>
+    </div>
+
+    <script>
+        // Get parameters from URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const id = urlParams.get('id');
+        const type = urlParams.get('type') || 'inmate';
+        const token = urlParams.get('token');
+        const api = urlParams.get('api') || 'http://localhost:8000/api';
+
+        function updateStatus(message, isError = false) {
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = message;
+            statusEl.className = isError ? 'status error' : 'status';
+        }
+
+        function launchClient() {
+            if (!id) {
+                updateStatus('Error: No ID provided', true);
+                return;
+            }
+
+            if (!token) {
+                updateStatus('Error: No authentication token provided', true);
+                return;
+            }
+
+            // Save parameters to localStorage for the protocol handler to retrieve
+            const params = {
+                id: id,
+                type: type,
+                token: token,
+                api: api,
+                timestamp: Date.now()
+            };
+
+            // Store in localStorage
+            localStorage.setItem('gp360_biometric_params', JSON.stringify(params));
+
+            // Create simple protocol URL with just the ID
+            const protocolUrl = `gp360://enroll?id=${id}`;
+
+            updateStatus('Opening biometric client...');
+
+            try {
+                // Try to launch using iframe
+                const iframe = document.createElement('iframe');
+                iframe.style.display = 'none';
+                iframe.src = protocolUrl;
+                document.body.appendChild(iframe);
+
+                setTimeout(() => {
+                    if (iframe.parentNode) {
+                        iframe.parentNode.removeChild(iframe);
+                    }
+                }, 2000);
+
+                // Also try direct navigation as backup
+                setTimeout(() => {
+                    window.location.href = protocolUrl;
+                }, 500);
+
+                updateStatus('Biometric client launched. You can close this window.');
+            } catch (error) {
+                updateStatus('Error launching client: ' + error.message, true);
+            }
+        }
+
+        // Auto-launch on page load
+        window.onload = () => {
+            launchClient();
+        };
+    </script>
+</body>
+</html>

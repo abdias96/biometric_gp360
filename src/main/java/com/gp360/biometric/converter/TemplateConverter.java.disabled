@@ -1,0 +1,164 @@
+package com.gp360.biometric.converter;
+
+import com.digitalpersona.uareu.*;
+import java.util.Base64;
+
+/**
+ * Converts DigitalPersona proprietary templates to standard formats
+ */
+public class TemplateConverter {
+
+    private static Engine engine;
+
+    static {
+        try {
+            engine = UareUGlobal.GetEngine();
+        } catch (UareUException e) {
+            System.err.println("Failed to initialize U.are.U Engine: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Convert DigitalPersona FMD to ANSI 378-2004 format
+     *
+     * @param fmdData The FMD data from DigitalPersona
+     * @return ANSI 378-2004 formatted template
+     */
+    public static byte[] convertToANSI378_2004(Fmd fmd) {
+        try {
+            if (fmd == null) {
+                return null;
+            }
+
+            // Export FMD to ANSI format
+            // DigitalPersona SDK supports ANSI 378-2004 export
+            byte[] ansiData = fmd.getData();
+
+            // The FMD getData() returns the template in the format it was created
+            // We need to ensure it's in ANSI format
+            if (fmd.getFormat() == Fmd.Format.ANSI_378_2004) {
+                return ansiData;
+            }
+
+            // If not in ANSI format, we need to convert
+            // Create a new FMD in ANSI format from the existing FMD
+            Fmd ansiFmd = engine.CreateFmd(ansiData,
+                fmd.getWidth(),
+                fmd.getHeight(),
+                fmd.getResolution(),
+                fmd.getCbeffId(),
+                Fmd.Format.ANSI_378_2004);
+
+            return ansiFmd.getData();
+
+        } catch (UareUException e) {
+            System.err.println("Failed to convert to ANSI 378-2004: " + e.getMessage());
+            // Return original data if conversion fails
+            return fmd != null ? fmd.getData() : null;
+        }
+    }
+
+    /**
+     * Convert DigitalPersona FMD to ISO 19794-2 format
+     *
+     * @param fmd The FMD from DigitalPersona
+     * @return ISO 19794-2 formatted template
+     */
+    public static byte[] convertToISO19794_2(Fmd fmd) {
+        try {
+            if (fmd == null) {
+                return null;
+            }
+
+            // Export FMD to ISO format
+            if (fmd.getFormat() == Fmd.Format.ISO_19794_2_2005) {
+                return fmd.getData();
+            }
+
+            // Convert to ISO format
+            Fmd isoFmd = engine.CreateFmd(fmd.getData(),
+                fmd.getWidth(),
+                fmd.getHeight(),
+                fmd.getResolution(),
+                fmd.getCbeffId(),
+                Fmd.Format.ISO_19794_2_2005);
+
+            return isoFmd.getData();
+
+        } catch (UareUException e) {
+            System.err.println("Failed to convert to ISO 19794-2: " + e.getMessage());
+            return fmd != null ? fmd.getData() : null;
+        }
+    }
+
+    /**
+     * Get the format string for the template
+     */
+    public static String getFormatString(Fmd.Format format) {
+        switch (format) {
+            case ANSI_378_2004:
+                return "ANSI_378_2004";
+            case ANSI_378_2009:
+                return "ANSI_378_2009";
+            case ANSI_378_2009_AM1:
+                return "ANSI_378_2009";
+            case ISO_19794_2_2005:
+                return "ISO_19794_2_2005";
+            case ISO_19794_2_2011:
+                return "ISO_19794_2_2011";
+            default:
+                return "PROPRIETARY";
+        }
+    }
+
+    /**
+     * Create FMD in specified format during enrollment
+     */
+    public static Fmd createFmdInFormat(byte[] templateData, Fmd.Format desiredFormat) {
+        try {
+            // First create FMD from the raw data
+            Fmd originalFmd = engine.CreateFmd(templateData,
+                256, // default width
+                360, // default height
+                500, // 500 DPI for DigitalPersona 4500
+                0,   // CBEFF ID
+                Fmd.Format.DP_PRE_REGISTRATION); // Original format
+
+            // Now convert to desired format
+            if (desiredFormat == Fmd.Format.DP_PRE_REGISTRATION) {
+                return originalFmd;
+            }
+
+            // Convert to desired format
+            return engine.CreateFmd(originalFmd.getData(),
+                originalFmd.getWidth(),
+                originalFmd.getHeight(),
+                originalFmd.getResolution(),
+                originalFmd.getCbeffId(),
+                desiredFormat);
+
+        } catch (UareUException e) {
+            System.err.println("Failed to create FMD in format " + desiredFormat + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Extract minutiae count from template (approximation)
+     */
+    public static int extractMinutiaeCount(byte[] templateData) {
+        // ANSI 378-2004 templates typically have header + minutiae data
+        // Each minutia is typically 6 bytes in standard format
+        // This is an approximation
+        if (templateData == null || templateData.length < 26) {
+            return 0;
+        }
+
+        // Skip header (26 bytes typical) and divide remaining by minutia size
+        int dataBytes = templateData.length - 26;
+        int estimatedMinutiae = dataBytes / 6;
+
+        // Typical fingerprint has 12-80 minutiae, cap at reasonable values
+        return Math.min(80, Math.max(12, estimatedMinutiae));
+    }
+}
