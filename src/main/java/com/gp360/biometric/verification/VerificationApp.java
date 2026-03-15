@@ -15,12 +15,17 @@ import java.awt.BasicStroke;
 import java.awt.Point;
 import java.awt.*;
 import java.awt.event.*;
+import javax.swing.DefaultListCellRenderer;
 import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.sql.*;
 import java.util.Base64;
 import java.util.Properties;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.ArrayList;
+import java.util.List;
 import org.json.JSONObject;
 import java.awt.Desktop;
 import java.net.URI;
@@ -49,6 +54,30 @@ public class VerificationApp extends JFrame {
     private Properties config;
     private double zoomLevel = 1.0;    // Nivel de zoom actual
     private JScrollPane fingerScrollPane; // ScrollPane para la imagen con zoom
+    private volatile boolean isCapturing = false; // Flag para evitar capturas concurrentes
+    private volatile boolean isVerifying = false; // Flag para evitar verificaciones concurrentes
+    private Thread currentCaptureThread = null; // Thread actual de captura
+
+    // Selector de dedo para verificación optimizada
+    private JComboBox<String> fingerSelector;
+    private String selectedFingerType = null; // null = todos los dedos
+
+    // Mapeo de nombres de dedos a valores de BD
+    private static final String[][] FINGER_OPTIONS = {
+        {"Todos los dedos (lento)", null},
+        {"─── MANO DERECHA ───", "SEPARATOR"},
+        {"Pulgar Derecho", "right_thumb"},
+        {"Índice Derecho", "right_index"},
+        {"Medio Derecho", "right_middle"},
+        {"Anular Derecho", "right_ring"},
+        {"Meñique Derecho", "right_pinky"},
+        {"─── MANO IZQUIERDA ───", "SEPARATOR"},
+        {"Pulgar Izquierdo", "left_thumb"},
+        {"Índice Izquierdo", "left_index"},
+        {"Medio Izquierdo", "left_middle"},
+        {"Anular Izquierdo", "left_ring"},
+        {"Meñique Izquierdo", "left_pinky"}
+    };
 
     // Configuración de base de datos
     private String dbUrl;
@@ -91,27 +120,45 @@ public class VerificationApp extends JFrame {
     private void loadConfiguration() {
         config = new Properties();
         try {
-            // Cargar desde archivo
+            // Cargar desde archivo externo primero
             File configFile = new File("config.properties");
             if (configFile.exists()) {
                 config.load(new FileInputStream(configFile));
+                log("Configuración cargada desde: " + configFile.getAbsolutePath());
+            } else {
+                // Intentar cargar desde recursos embebidos
+                InputStream is = getClass().getResourceAsStream("/config/application.properties");
+                if (is != null) {
+                    config.load(is);
+                    log("Configuración cargada desde recursos embebidos");
+                }
             }
 
             // Sobrescribir con propiedades del sistema si existen
             String apiUrl = System.getProperty("api.url", config.getProperty("api.url", "http://localhost:8000/api"));
-            apiToken = System.getProperty("api.token", config.getProperty("api.token", ""));
+            apiToken = System.getProperty("api.token", config.getProperty("api.token", "gp360-biometric-service-2024"));
+
+            // Leer callback URL - intentar con punto y con guión bajo para compatibilidad
             apiCallbackUrl = System.getProperty("callback.url",
-                config.getProperty("api.callback_url", apiUrl + "/biometric-callback/capture-completed"));
+                config.getProperty("api.callback.verification",
+                    config.getProperty("api.callback_url", apiUrl + "/biometric/callback/verification")));
 
-            // Configuración de BD
-            String dbHost = System.getProperty("db.host", config.getProperty("db.host", "127.0.0.1"));
-            String dbPort = System.getProperty("db.port", config.getProperty("db.port", "3306"));
-            String dbName = System.getProperty("db.database", config.getProperty("db.database", "gp360"));
-            dbUser = System.getProperty("db.username", config.getProperty("db.username", "root"));
+            // Configuración de BD - Leer URL completa o construir
+            dbUrl = config.getProperty("db.url");
+            if (dbUrl == null || dbUrl.isEmpty()) {
+                // Construir URL si no está completa
+                String dbHost = System.getProperty("db.host", config.getProperty("db.host", "127.0.0.1"));
+                String dbPort = System.getProperty("db.port", config.getProperty("db.port", "3306"));
+                String dbName = System.getProperty("db.database", config.getProperty("db.database", "siapen"));
+                dbUrl = String.format("jdbc:mysql://%s:%s/%s?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true",
+                    dbHost, dbPort, dbName);
+            }
+
+            // Usuario y contraseña - soportar ambos formatos
+            dbUser = System.getProperty("db.user",
+                config.getProperty("db.user",
+                    config.getProperty("db.username", "root")));
             dbPassword = System.getProperty("db.password", config.getProperty("db.password", ""));
-
-            dbUrl = String.format("jdbc:mysql://%s:%s/%s?useSSL=false&serverTimezone=UTC",
-                dbHost, dbPort, dbName);
 
             log("Configuración cargada:");
             log("API Callback: " + apiCallbackUrl);
@@ -119,11 +166,12 @@ public class VerificationApp extends JFrame {
 
         } catch (Exception e) {
             log("Error cargando configuración: " + e.getMessage());
+            e.printStackTrace();
             // Usar valores por defecto
-            dbUrl = "jdbc:mysql://localhost:3306/gp360?useSSL=false&serverTimezone=UTC";
+            dbUrl = "jdbc:mysql://localhost:3306/siapen?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true";
             dbUser = "root";
             dbPassword = "";
-            apiCallbackUrl = "http://localhost:8000/api/biometric-callback/capture-completed";
+            apiCallbackUrl = "http://localhost:8000/api/biometric/callback/verification";
             apiToken = "gp360-biometric-service-2024";
         }
     }
@@ -157,13 +205,82 @@ public class VerificationApp extends JFrame {
         GridBagConstraints gbc = new GridBagConstraints();
         gbc.insets = new Insets(10, 10, 10, 10);
 
-        // Instrucciones
-        JLabel instructionLabel = new JLabel("Coloque el dedo índice derecho en el lector");
-        instructionLabel.setFont(new Font("Arial", Font.PLAIN, 16));
+        // Panel de selección de dedo
+        JPanel fingerSelectionPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 15, 5));
+        fingerSelectionPanel.setBackground(Color.WHITE);
+
+        JLabel instructionLabel = new JLabel("Seleccione el dedo a verificar:");
+        instructionLabel.setFont(new Font("Arial", Font.BOLD, 16));
+        fingerSelectionPanel.add(instructionLabel);
+
+        // Crear combo box con opciones de dedos
+        fingerSelector = new JComboBox<>();
+        fingerSelector.setFont(new Font("Arial", Font.PLAIN, 14));
+        fingerSelector.setPreferredSize(new Dimension(220, 35));
+
+        // Agregar opciones
+        for (String[] option : FINGER_OPTIONS) {
+            fingerSelector.addItem(option[0]);
+        }
+
+        // Por defecto seleccionar "Índice Derecho" (opción 3)
+        fingerSelector.setSelectedIndex(3);
+        selectedFingerType = "right_index";
+
+        // Listener para actualizar la selección
+        fingerSelector.addActionListener(e -> {
+            int index = fingerSelector.getSelectedIndex();
+            if (index >= 0 && index < FINGER_OPTIONS.length) {
+                String value = FINGER_OPTIONS[index][1];
+                // Ignorar separadores
+                if ("SEPARATOR".equals(value)) {
+                    // Volver a la selección anterior válida
+                    fingerSelector.setSelectedIndex(3); // Índice derecho por defecto
+                    return;
+                }
+                selectedFingerType = value;
+                String fingerName = FINGER_OPTIONS[index][0];
+                log("Dedo seleccionado: " + fingerName +
+                    (selectedFingerType == null ? " (búsqueda completa)" : " (búsqueda optimizada)"));
+
+                // Actualizar instrucción
+                if (selectedFingerType != null) {
+                    statusLabel.setText("Coloque el " + fingerName.toLowerCase() + " en el lector");
+                } else {
+                    statusLabel.setText("Coloque cualquier dedo en el lector");
+                }
+            }
+        });
+
+        // Renderizador personalizado para deshabilitar separadores
+        fingerSelector.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value,
+                    int index, boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                if (index >= 0 && index < FINGER_OPTIONS.length &&
+                    "SEPARATOR".equals(FINGER_OPTIONS[index][1])) {
+                    setEnabled(false);
+                    setBackground(new Color(230, 230, 230));
+                    setForeground(new Color(100, 100, 100));
+                    setFont(getFont().deriveFont(Font.BOLD));
+                }
+                return this;
+            }
+        });
+
+        fingerSelectionPanel.add(fingerSelector);
+
+        // Etiqueta de ayuda
+        JLabel helpLabel = new JLabel("(Seleccionar dedo específico acelera la búsqueda)");
+        helpLabel.setFont(new Font("Arial", Font.ITALIC, 11));
+        helpLabel.setForeground(new Color(100, 100, 100));
+        fingerSelectionPanel.add(helpLabel);
+
         gbc.gridx = 0;
         gbc.gridy = 0;
         gbc.gridwidth = 2;
-        centerPanel.add(instructionLabel, gbc);
+        centerPanel.add(fingerSelectionPanel, gbc);
 
         // Panel de visualización de huella capturada con zoom
         fingerPanel = new JPanel(new BorderLayout());
@@ -416,66 +533,226 @@ public class VerificationApp extends JFrame {
     }
 
     private void initializeBiometric() {
+        ReaderCollection readers = null;
+
         try {
-            // Inicializar el SDK de DigitalPersona
-            ReaderCollection readers = UareUGlobal.GetReaderCollection();
-            readers.GetReaders();
+            log("Iniciando verificación del lector biométrico...");
 
-            if (readers.size() > 0) {
-                reader = readers.get(0);
-                log("Lector encontrado: " + reader.GetDescription().name);
-                log("Fabricante: " + reader.GetDescription().id.vendor_name);
-                log("Producto: " + reader.GetDescription().id.product_name);
+            // Validación temprana: verificar que las bibliotecas nativas están disponibles
+            try {
+                // Intento 1: Obtener colección de lectores (puede crashear si drivers no están)
+                log("Paso 1: Obteniendo colección de lectores...");
+                readers = UareUGlobal.GetReaderCollection();
 
-                // Intentar abrir con prioridad cooperativa primero
-                try {
-                    reader.Open(com.digitalpersona.uareu.Reader.Priority.COOPERATIVE);
-                } catch (UareUException e) {
-                    // Si falla, intentar con exclusiva
-                    log("No se pudo abrir en modo cooperativo, intentando modo exclusivo...");
-                    try {
-                        reader.Open(com.digitalpersona.uareu.Reader.Priority.EXCLUSIVE);
-                    } catch (UareUException ex) {
-                        log("Error abriendo lector: " + ex.getMessage());
-                        throw ex;
-                    }
+                if (readers == null) {
+                    throw new Exception("GetReaderCollection() retornó null - SDK no disponible");
                 }
-                log("Lector abierto correctamente");
 
-                // Verificar estado
-                com.digitalpersona.uareu.Reader.Status status = reader.GetStatus();
-                log("Estado del lector: " + (status.status == com.digitalpersona.uareu.Reader.ReaderStatus.READY ? "LISTO" : "NO LISTO"));
+            } catch (UareUException ue) {
+                // Error específico del SDK
+                log("⚠ Error del SDK DigitalPersona: " + ue.getMessage() + " (Código: " + ue.getCode() + ")");
+                throw new Exception("SDK de DigitalPersona no disponible. Verifique que los drivers estén instalados.", ue);
 
-                // Inicializar motor de verificación
-                engine = UareUGlobal.GetEngine();
-                log("✓ Motor de verificación inicializado");
+            } catch (UnsatisfiedLinkError ule) {
+                // No se pudieron cargar las DLLs nativas
+                log("⚠ Error de biblioteca nativa: " + ule.getMessage());
+                throw new Exception("Bibliotecas nativas de DigitalPersona no encontradas. " +
+                                  "Reinstale los drivers del lector biométrico.", ule);
 
-                statusLabel.setText("Lector listo - Presione CAPTURAR HUELLA");
-                statusLabel.setForeground(new Color(0, 150, 0));
+            } catch (Throwable t) {
+                // Cualquier otro error incluyendo crashes nativos
+                log("⚠ Error crítico al acceder al SDK: " + t.getClass().getName() + " - " + t.getMessage());
+                throw new Exception("Error crítico inicializando SDK. " +
+                                  "Asegúrese de que el lector esté conectado y los drivers instalados.", t);
+            }
+
+            // Paso 2: Obtener lista de lectores (también puede crashear)
+            try {
+                log("Paso 2: Escaneando lectores conectados...");
+                readers.GetReaders();
+                log("Escaneo completado. Lectores encontrados: " + readers.size());
+
+            } catch (UareUException ue) {
+                log("⚠ Error escaneando lectores: " + ue.getMessage());
+                // No crashear, simplemente reportar 0 lectores
+
+            } catch (Throwable t) {
+                log("⚠ Error crítico escaneando lectores: " + t.getMessage());
+                throw new Exception("Error al escanear lectores conectados.", t);
+            }
+
+            // Verificar si hay lectores disponibles
+            if (readers != null && readers.size() > 0) {
+                log("Paso 3: Inicializando lector...");
+
+                try {
+                    reader = readers.get(0);
+
+                    // Obtener descripción del lector
+                    com.digitalpersona.uareu.Reader.Description desc = reader.GetDescription();
+                    log("Lector encontrado: " + desc.name);
+                    log("Fabricante: " + desc.id.vendor_name);
+                    log("Producto: " + desc.id.product_name);
+
+                    // Intentar abrir con prioridad cooperativa primero
+                    log("Paso 4: Abriendo conexión con el lector...");
+                    try {
+                        reader.Open(com.digitalpersona.uareu.Reader.Priority.COOPERATIVE);
+                        log("Lector abierto en modo COOPERATIVO");
+                    } catch (UareUException e) {
+                        // Si falla, intentar con exclusiva
+                        log("No se pudo abrir en modo cooperativo, intentando modo EXCLUSIVO...");
+                        try {
+                            reader.Open(com.digitalpersona.uareu.Reader.Priority.EXCLUSIVE);
+                            log("Lector abierto en modo EXCLUSIVO");
+                        } catch (UareUException ex) {
+                            log("⚠ Error abriendo lector: " + ex.getMessage());
+                            throw new Exception("No se pudo abrir el lector. Otro programa puede estar usándolo.", ex);
+                        }
+                    }
+
+                    // Verificar estado
+                    log("Paso 5: Verificando estado del lector...");
+                    com.digitalpersona.uareu.Reader.Status status = reader.GetStatus();
+                    String statusText = status.status == com.digitalpersona.uareu.Reader.ReaderStatus.READY ? "LISTO" :
+                                       status.status == com.digitalpersona.uareu.Reader.ReaderStatus.BUSY ? "OCUPADO" :
+                                       status.status == com.digitalpersona.uareu.Reader.ReaderStatus.NEED_CALIBRATION ? "NECESITA CALIBRACIÓN" :
+                                       "DESCONOCIDO";
+                    log("Estado del lector: " + statusText);
+
+                    // Inicializar motor de verificación
+                    log("Paso 6: Inicializando motor de coincidencia...");
+                    engine = UareUGlobal.GetEngine();
+                    log("✓ Motor de verificación inicializado correctamente");
+
+                    // TODO CORRECTO - Actualizar UI
+                    statusLabel.setText("Sistema listo - Presione CAPTURAR HUELLA");
+                    statusLabel.setForeground(new Color(0, 150, 0));
+                    log("=======================================");
+                    log("INICIALIZACION EXITOSA");
+                    log("=======================================");
+
+                } catch (UareUException ue) {
+                    log("⚠ Error específico del lector: " + ue.getMessage());
+                    throw new Exception("Error inicializando lector: " + ue.getMessage(), ue);
+
+                } catch (Throwable t) {
+                    log("⚠ Error crítico con el lector: " + t.getMessage());
+                    throw new Exception("Error crítico inicializando lector", t);
+                }
 
             } else {
-                log("⚠ No se encontró ningún lector biométrico");
-                statusLabel.setText("Error: No se encontró lector biométrico");
-                statusLabel.setForeground(Color.RED);
-                captureButton.setEnabled(false);
+                // NO HAY LECTORES CONECTADOS
+                log("=======================================");
+                log("ADVERTENCIA: Sin lector biometrico");
+                log("=======================================");
+                log("");
+                log("No se encontro ningun lector biometrico conectado.");
+                log("Por favor:");
+                log("1. Conecte un lector DigitalPersona al puerto USB");
+                log("2. Verifique que los drivers esten instalados");
+                log("3. Reinicie esta aplicacion");
+                log("");
+
+                // Mostrar dialogo de error amigable
+                javax.swing.SwingUtilities.invokeLater(() -> {
+                    statusLabel.setText("Error: No se encontro lector biometrico");
+                    statusLabel.setForeground(Color.RED);
+                    captureButton.setEnabled(false);
+
+                    JOptionPane.showMessageDialog(this,
+                        "No se detecto ningun lector biometrico conectado.\n\n" +
+                        "Por favor:\n" +
+                        "1. Conecte un lector DigitalPersona compatible al puerto USB\n" +
+                        "2. Verifique que los drivers esten correctamente instalados\n" +
+                        "3. Cierre y vuelva a abrir esta aplicacion\n\n" +
+                        "Si el problema persiste, contacte al administrador del sistema.",
+                        "Lector No Disponible",
+                        JOptionPane.WARNING_MESSAGE);
+                });
             }
 
         } catch (Exception e) {
-            log("Error inicializando biométrico: " + e.getMessage());
+            // ERROR MANEJADO - Mostrar mensaje amigable
+            log("=======================================");
+            log("ERROR DE INICIALIZACION");
+            log("=======================================");
+            log("Error: " + e.getMessage());
+            if (e.getCause() != null) {
+                log("Causa: " + e.getCause().getMessage());
+            }
+            log("");
+            log("La aplicacion continuara pero no podra capturar huellas.");
+            log("Por favor, resuelva el problema y reinicie la aplicacion.");
             e.printStackTrace();
-            statusLabel.setText("Error: " + e.getMessage());
-            statusLabel.setForeground(Color.RED);
-            captureButton.setEnabled(false);
+
+            javax.swing.SwingUtilities.invokeLater(() -> {
+                statusLabel.setText("Error: " + e.getMessage());
+                statusLabel.setForeground(Color.RED);
+                captureButton.setEnabled(false);
+
+                JOptionPane.showMessageDialog(this,
+                    "Error al inicializar el sistema biometrico:\n\n" +
+                    e.getMessage() + "\n\n" +
+                    "La aplicacion no podra capturar huellas dactilares.\n" +
+                    "Por favor, verifique que:\n" +
+                    "- El lector biometrico este conectado\n" +
+                    "- Los drivers de DigitalPersona esten instalados\n" +
+                    "- Ningun otro programa este usando el lector\n\n" +
+                    "Luego reinicie esta aplicacion.",
+                    "Error de Inicializacion",
+                    JOptionPane.ERROR_MESSAGE);
+            });
         }
     }
 
     private void captureFingerprint() {
-        new Thread(() -> {
+        // Verificar primero si el lector está disponible
+        if (reader == null || engine == null) {
+            SwingUtilities.invokeLater(() -> {
+                statusLabel.setText("Error: Lector no disponible");
+                statusLabel.setForeground(Color.RED);
+                log("Error: El lector biometrico no esta disponible");
+
+                JOptionPane.showMessageDialog(this,
+                    "No se puede capturar huellas porque el lector biometrico no esta disponible.\n\n" +
+                    "Posibles causas:\n" +
+                    "- El lector no esta conectado\n" +
+                    "- Los drivers no estan instalados\n" +
+                    "- Otro programa esta usando el lector\n\n" +
+                    "Por favor, cierre esta ventana, resuelva el problema y vuelva a lanzar la aplicacion.",
+                    "Lector No Disponible",
+                    JOptionPane.ERROR_MESSAGE);
+            });
+            return;
+        }
+
+        // Evitar capturas concurrentes
+        if (isCapturing) {
+            log("Ya hay una captura en progreso, espere a que termine");
+            return;
+        }
+
+        // Cancelar thread de captura anterior si existe
+        if (currentCaptureThread != null && currentCaptureThread.isAlive()) {
             try {
+                log("Cancelando captura anterior...");
+                reader.CancelCapture();
+                currentCaptureThread.interrupt();
+                currentCaptureThread.join(1000); // Esperar máximo 1 segundo
+            } catch (Exception e) {
+                log("Error cancelando captura anterior: " + e.getMessage());
+            }
+        }
+
+        currentCaptureThread = new Thread(() -> {
+            try {
+                isCapturing = true;
                 SwingUtilities.invokeLater(() -> {
                     statusLabel.setText("Capturando... Coloque el dedo en el lector");
                     statusLabel.setForeground(Color.BLUE);
                     captureButton.setEnabled(false);
+                    verifyButton.setEnabled(false); // Desactivar verificar también
                     log("Iniciando captura...");
                 });
 
@@ -558,17 +835,28 @@ public class VerificationApp extends JFrame {
                     captureButton.setEnabled(true);
                     log("Error en captura: " + e.getMessage());
                 });
+            } finally {
+                isCapturing = false;
             }
-        }).start();
+        });
+        currentCaptureThread.start();
     }
 
     private void performVerification() {
+        // Evitar verificaciones concurrentes
+        if (isVerifying) {
+            log("Ya hay una verificación en progreso, espere a que termine");
+            return;
+        }
+
         new Thread(() -> {
             try {
+                isVerifying = true;
                 SwingUtilities.invokeLater(() -> {
                     statusLabel.setText("Verificando contra base de datos...");
                     statusLabel.setForeground(Color.BLUE);
                     verifyButton.setEnabled(false);
+                    captureButton.setEnabled(false); // Desactivar captura durante verificación
                     log("Iniciando verificación 1:N...");
 
                     // Actualizar panel de estadísticas con proceso de verificación
@@ -598,37 +886,43 @@ public class VerificationApp extends JFrame {
                             "Cerrar Alerta"
                         };
 
+                        // Preparar mensaje con nombre o ID
+                        String inmateDisplay = result.matchedInmateName != null && !result.matchedInmateName.isEmpty()
+                            ? result.matchedInmateName + " (ID: " + result.matchedInmateId + ")"
+                            : "ID: " + result.matchedInmateId;
+
                         int response = JOptionPane.showOptionDialog(this,
                             "¡ALERTA DE REINCIDENTE!\n\n" +
-                            "Se encontró coincidencia con el interno ID: " + result.matchedInmateId + "\n" +
+                            "Se encontró coincidencia con:\n" + inmateDisplay + "\n\n" +
                             "Puntuación de coincidencia: " + String.format("%.2f%%", result.matchScore * 100) + "\n" +
                             "Minutiae coincidentes: ~" + result.matchedMinutiae + "\n" +
                             "Confianza del sistema: " + (result.matchScore > 0.9 ? "MUY ALTA" :
                                                        result.matchScore > 0.8 ? "ALTA" :
                                                        result.matchScore > 0.7 ? "MEDIA" : "BAJA") + "\n\n" +
                             "¿Qué desea hacer?",
-                            "⚠️ Coincidencia Encontrada - ID: " + result.matchedInmateId,
+                            "⚠️ Coincidencia Encontrada",
                             JOptionPane.DEFAULT_OPTION,
                             JOptionPane.WARNING_MESSAGE,
                             null,
                             options,
                             options[0]);
 
-                        log("⚠ COINCIDENCIA: Interno ID " + result.matchedInmateId +
+                        log("⚠ COINCIDENCIA: " + inmateDisplay +
                             " (Score: " + String.format("%.2f%%", result.matchScore * 100) + ")");
 
                         if (response == 0) {
                             // Ver perfil del PPL en el navegador
                             openInmateProfile(result.matchedInmateId);
-                            // NO resetear para permitir ver el análisis
-                            return; // Salir sin resetear la interfaz
+                            // NO resetear - mantener el análisis visible
+                            captureButton.setEnabled(true);
+                            return; // Salir sin resetear
                         } else if (response == 1) {
-                            // Nueva verificación - continúa con el reseteo normal
-                        }
-                        // Si es 2 (Cerrar Alerta) o CLOSED_OPTION, solo cerrar el diálogo
-                        // NO resetear para permitir ver el análisis
-                        else {
-                            return; // Salir sin resetear la interfaz
+                            // Nueva verificación - SÍ resetear interfaz (esto ya funcionaba)
+                            // Continúa al resetInterface() al final
+                        } else {
+                            // Cerrar Alerta o X - NO resetear, mantener análisis visible
+                            captureButton.setEnabled(true);
+                            return; // Salir sin resetear
                         }
                     } else {
                         statusLabel.setText("Sin coincidencias - Persona nueva en el sistema");
@@ -657,35 +951,35 @@ public class VerificationApp extends JFrame {
 
                         log("✓ Sin coincidencias - Persona nueva");
 
-                        if (response == 1 || response == JOptionPane.CLOSED_OPTION) {
-                            // Cerrar alerta solamente, mantener el análisis visible
-                            return; // Salir sin resetear la interfaz
+                        if (response == 0) {
+                            // Nueva Verificación - SÍ resetear interfaz
+                            // Continúa al resetInterface() al final
+                        } else {
+                            // Cerrar alerta o X - NO resetear, mantener análisis visible
+                            captureButton.setEnabled(true);
+                            return; // Salir sin resetear
                         }
-                        // Si es 0 (Nueva Verificación), continúa con el reseteo normal
                     }
 
-                    // Resetear para nueva verificación
-                    capturedTemplate = null;
-                    verifyButton.setEnabled(false);
-                    qualityBar.setValue(0);
-                    qualityBar.setString("0%");
-                    qualityLabel.setText("Calidad: --");
-                    statusLabel.setText("Listo para nueva captura");
-                    statusLabel.setForeground(new Color(0, 100, 0));
+                    // Resetear para nueva verificación (solo si no se hizo return antes)
+                    resetInterface();
                 });
 
             } catch (Exception e) {
                 SwingUtilities.invokeLater(() -> {
                     statusLabel.setText("Error en verificación: " + e.getMessage());
                     statusLabel.setForeground(Color.RED);
-                    verifyButton.setEnabled(true);
+                    captureButton.setEnabled(true);
+                    verifyButton.setEnabled(false);
                     log("Error: " + e.getMessage());
                 });
+            } finally {
+                isVerifying = false;
             }
         }).start();
     }
 
-    // Método mejorado de verificación con visualización del proceso
+    // Método optimizado de verificación 1:N con carga masiva y comparación paralela
     private VerificationResult verifyAgainstDatabaseEnhanced(byte[] templateToVerify) {
         VerificationResult result = new VerificationResult();
         long startTime = System.currentTimeMillis();
@@ -698,267 +992,281 @@ public class VerificationApp extends JFrame {
                 Fmd.Format.ANSI_378_2004
             );
 
+            // VALIDACIÓN CRÍTICA: Verificar que el FMD capturado tenga vistas válidas
+            if (fmdToVerify == null) {
+                log("ERROR: No se pudo crear FMD del template capturado");
+                return result;
+            }
+
+            Fmd.Fmv[] capturedViews = fmdToVerify.getViews();
+            if (capturedViews == null || capturedViews.length == 0) {
+                log("ERROR: FMD capturado sin vistas válidas");
+                return result;
+            }
+
+            if (capturedViews[0] == null || capturedViews[0].getData() == null || capturedViews[0].getData().length == 0) {
+                log("ERROR: Vista 0 del FMD capturado inválida");
+                return result;
+            }
+
+            log("FMD capturado validado: " + capturedViews.length + " vista(s), " +
+                capturedViews[0].getData().length + " bytes en vista 0");
+
             try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPassword)) {
 
-                // Contar registros totales
+                final String fingerFilter = selectedFingerType;
                 SwingUtilities.invokeLater(() -> {
-                    statsArea.append("✓ Conectado a BD\n");
-                    statsArea.append("\nContando registros...\n");
+                    statsArea.append("Conectado a BD\n");
+                    if (fingerFilter != null) {
+                        statsArea.append("Filtro: " + fingerFilter + "\n");
+                    } else {
+                        statsArea.append("Sin filtro (todos los dedos)\n");
+                    }
+                    statsArea.append("\nCargando candidatos...\n");
                 });
 
-                String countQuery = "SELECT COUNT(DISTINCT inmate_id) as total FROM inmate_biometric_data WHERE fingerprint_template IS NOT NULL";
-                PreparedStatement countStmt = conn.prepareStatement(countQuery);
-                ResultSet countRs = countStmt.executeQuery();
-                int totalRecords = 0;
-                if (countRs.next()) {
-                    totalRecords = countRs.getInt("total");
+                // ═══════════════════════════════════════════════
+                // FASE 1: Carga masiva con pre-procesamiento
+                // ═══════════════════════════════════════════════
+                long loadStart = System.currentTimeMillis();
+
+                // Query unified biometric_data table (includes both inmates and visitors)
+                String query = "SELECT enrollable_id, enrollable_type, finger_type, fingerprint_template " +
+                    "FROM biometric_data WHERE is_active = 1 AND fingerprint_template IS NOT NULL AND deleted_at IS NULL" +
+                    (fingerFilter != null ? " AND finger_type = ?" : "") +
+                    " AND fingerprint_quality >= 40";
+
+                PreparedStatement stmt = conn.prepareStatement(query);
+                stmt.setFetchSize(1000);
+                if (fingerFilter != null) {
+                    stmt.setString(1, fingerFilter);
+                    log("Busqueda optimizada: solo dedo '" + fingerFilter + "'");
+                } else {
+                    log("Busqueda completa: todos los dedos");
                 }
 
-                final int finalTotal = totalRecords;
-                SwingUtilities.invokeLater(() -> {
-                    statsArea.append("📊 Total internos: " + finalTotal + "\n");
-                    statsArea.append("\n🔍 INICIANDO COMPARACIÓN...\n");
-                    statsArea.append("─────────────────────\n");
-                });
-
-                // Obtener todas las huellas
-                // La consulta debe obtener los datos como en el método original
-                String query = "SELECT inmate_id, finger_type, fingerprint_template FROM inmate_biometric_data WHERE is_active = 1";
-                PreparedStatement stmt = conn.prepareStatement(query);
                 ResultSet rs = stmt.executeQuery();
 
-                int recordCount = 0;
-                int highScores = 0;
-                int maxScore = 0;
+                List<CandidateRecord> candidates = new ArrayList<>(25000);
+                Importer importer = UareUGlobal.GetImporter();
+                int skipped = 0;
+                int loaded = 0;
 
                 while (rs.next()) {
-                    int inmateId = rs.getInt("inmate_id");
-                    String fingerType = rs.getString("finger_type");
-                    // Los templates están almacenados como base64 en la BD
-                    String base64Template = rs.getString("fingerprint_template");
-                    byte[] storedTemplate = null;
+                    loaded++;
+                    String b64 = rs.getString("fingerprint_template");
+                    if (b64 == null || b64.isEmpty()) { skipped++; continue; }
 
-                    if (base64Template != null && !base64Template.isEmpty()) {
+                    try {
+                        byte[] bytes;
                         try {
-                            // Decodificar base64 a bytes
-                            storedTemplate = Base64.getDecoder().decode(base64Template);
-                        } catch (Exception e) {
-                            // Si no es base64, intentar obtener como bytes directos
-                            storedTemplate = rs.getBytes("fingerprint_template");
+                            bytes = Base64.getDecoder().decode(b64);
+                        } catch (Exception decodeEx) {
+                            bytes = rs.getBytes("fingerprint_template");
                         }
-                    }
 
-                    recordCount++;
+                        if (bytes == null || bytes.length < 30 || bytes.length > 10000) { skipped++; continue; }
 
-                    // Actualizar progreso cada 5 registros
-                    if (recordCount % 5 == 0 || recordCount == 1) {
-                        final int count = recordCount;
-                        SwingUtilities.invokeLater(() -> {
-                            // Limpiar línea anterior y mostrar progreso
-                            String progress = String.format("Procesando: %d/%d (%.1f%%)",
-                                count, finalTotal, (count * 100.0 / finalTotal));
-                            statsArea.append(progress + "\n");
-                        });
-                    }
-
-                    if (storedTemplate != null && storedTemplate.length > 0) {
-                        try {
-                            // Decodificar base64 si es necesario
-                            byte[] templateBytes = storedTemplate;
-
-
-                            // Crear FMD del template almacenado
-                            Fmd storedFmd = UareUGlobal.GetImporter().ImportFmd(
-                                templateBytes,
-                                Fmd.Format.ANSI_378_2004,
-                                Fmd.Format.ANSI_378_2004
-                            );
-
-                            // Comparar templates
-                            int score = engine.Compare(fmdToVerify, 0, storedFmd, 0);
-
-                            if (score > maxScore) {
-                                maxScore = score;
-                            }
-
-                            // Si el score es significativo, mostrarlo
-                            if (score > 5000) {
-                                highScores++;
-                                final int finalScore = score;
-                                final int finalInmateId = inmateId;
-                                final String finalFinger = fingerType;
-
-                                SwingUtilities.invokeLater(() -> {
-                                    if (finalScore > 10000) {
-                                        statsArea.append(String.format("⚠️ Score alto: %d (ID:%d, %s)\n",
-                                            finalScore, finalInmateId, finalFinger));
-                                    }
-                                });
-                            }
-
-                            // Verificar si es coincidencia
-                            // IMPORTANTE: En DigitalPersona, menor score = mejor coincidencia
-                            if (score < MATCH_THRESHOLD) {
-                                result.foundMatch = true;
-                                result.matchedInmateId = inmateId;
-                                result.realScore = score;  // Guardar score real
-                                // Convertir score a porcentaje de confianza (inversamente proporcional)
-                                // Score 0 = 100% confianza, Score 100000 = 0% confianza
-                                result.matchScore = Math.max(0, (100000.0 - score) / 100000.0);
-                                result.matchedMinutiae = estimateMatchedMinutiae(score);
-                                result.matchDetails = "Coincidencia en " + fingerType;
-
-                                SwingUtilities.invokeLater(() -> {
-                                    statsArea.append("\n✅ ¡COINCIDENCIA ENCONTRADA!\n");
-                                    statsArea.append("─────────────────────\n");
-                                    statsArea.append("ID Interno: " + inmateId + "\n");
-                                    statsArea.append("Dedo: " + fingerType + "\n");
-                                    statsArea.append("Score: " + score + " (menor=mejor)\n");
-                                    statsArea.append("Umbral: < " + MATCH_THRESHOLD + "\n");
-                                    statsArea.append("Confianza: " + String.format("%.1f%%", result.matchScore * 100) + "\n");
-                                });
-
-                                log("✅ ¡COINCIDENCIA! ID: " + inmateId + ", Score: " + score);
-
-                                result.totalComparisons = recordCount;
-                                result.verificationTime = System.currentTimeMillis() - startTime;
-                                return result;
-                            }
-
-                        } catch (Exception e) {
-                            // Ignorar templates inválidos
+                        // Verificar no-todo-ceros (primeros 10 bytes)
+                        boolean allZeros = true;
+                        for (int i = 0; i < Math.min(bytes.length, 10); i++) {
+                            if (bytes[i] != 0) { allZeros = false; break; }
                         }
-                    }
+                        if (allZeros) { skipped++; continue; }
+
+                        Fmd fmd = importer.ImportFmd(bytes, Fmd.Format.ANSI_378_2004, Fmd.Format.ANSI_378_2004);
+                        if (fmd == null || fmd.getData() == null || fmd.getData().length < 30) { skipped++; continue; }
+
+                        Fmd.Fmv[] views = fmd.getViews();
+                        if (views == null || views.length == 0 || views[0] == null ||
+                            views[0].getData() == null || views[0].getData().length == 0) { skipped++; continue; }
+
+                        candidates.add(new CandidateRecord(rs.getInt("enrollable_id"), rs.getString("enrollable_type"), rs.getString("finger_type"), fmd));
+                    } catch (Exception e) { skipped++; }
                 }
 
-                result.totalComparisons = recordCount;
-                result.verificationTime = System.currentTimeMillis() - startTime;
+                rs.close();
+                stmt.close();
 
-                if (!result.foundMatch) {
-                    final int finalHighScores = highScores;
-                    final int finalMaxScore = maxScore;
-                    final int finalRecordCount = recordCount;
+                long loadTime = System.currentTimeMillis() - loadStart;
+                final int totalCandidates = candidates.size();
+                final int finalSkipped = skipped;
+                final int finalLoaded = loaded;
+                final long finalLoadTime = loadTime;
+
+                log("Candidatos cargados: " + totalCandidates + " (saltados: " + skipped + ", tiempo: " + loadTime + "ms)");
+
+                SwingUtilities.invokeLater(() -> {
+                    statsArea.append("Registros leidos: " + finalLoaded + "\n");
+                    statsArea.append("Candidatos validos: " + totalCandidates + "\n");
+                    statsArea.append("Saltados: " + finalSkipped + "\n");
+                    statsArea.append("Tiempo carga: " + finalLoadTime + " ms\n");
+                    statsArea.append("\nIniciando comparacion paralela...\n");
+                    statsArea.append("----------------------------\n");
+                });
+
+                if (totalCandidates == 0) {
+                    result.verificationTime = System.currentTimeMillis() - startTime;
                     SwingUtilities.invokeLater(() -> {
-                        statsArea.append("\n❌ Sin coincidencias\n");
-                        statsArea.append("─────────────────────\n");
-                        statsArea.append("Comparaciones: " + finalRecordCount + "\n");
-                        statsArea.append("Scores altos: " + finalHighScores + "\n");
-                        statsArea.append("Score máximo: " + finalMaxScore + "\n");
-                        statsArea.append("Tiempo: " + result.verificationTime + " ms\n");
+                        statsArea.append("\nSin candidatos para comparar\n");
+                    });
+                    return result;
+                }
+
+                // ═══════════════════════════════════════════════
+                // FASE 2: Comparación paralela con ExecutorService
+                // ═══════════════════════════════════════════════
+                long compareStart = System.currentTimeMillis();
+                int nThreads = Math.min(Runtime.getRuntime().availableProcessors(), 8);
+                ExecutorService executor = Executors.newFixedThreadPool(nThreads);
+                AtomicBoolean matchFound = new AtomicBoolean(false);
+                AtomicInteger processedCount = new AtomicInteger(0);
+                AtomicReference<VerificationResult> matchRef = new AtomicReference<>();
+
+                // Timer para actualizar UI cada 300ms (no dentro del loop)
+                Timer uiTimer = new Timer(300, e -> {
+                    int done = processedCount.get();
+                    if (done > 0 && !matchFound.get()) {
+                        statsArea.setText(statsArea.getText().replaceAll("Comparando: \\d+/\\d+ \\(\\d+\\.\\d+%\\)\n?", ""));
+                        statsArea.append(String.format("Comparando: %d/%d (%.1f%%)\n",
+                            done, totalCandidates, (done * 100.0 / totalCandidates)));
+                    }
+                });
+                uiTimer.start();
+
+                // Dividir en chunks y comparar en paralelo
+                int chunkSize = Math.max(1, totalCandidates / nThreads);
+                List<Future<VerificationResult>> futures = new ArrayList<>();
+                final int finalNThreads = nThreads;
+
+                for (int i = 0; i < nThreads; i++) {
+                    int start = i * chunkSize;
+                    int end = (i == nThreads - 1) ? totalCandidates : Math.min(start + chunkSize, totalCandidates);
+                    if (start >= totalCandidates) break;
+
+                    List<CandidateRecord> chunk = candidates.subList(start, end);
+
+                    futures.add(executor.submit(() -> {
+                        Engine threadEngine = UareUGlobal.GetEngine();
+
+                        for (CandidateRecord candidate : chunk) {
+                            if (matchFound.get()) return null;  // Otro thread ya encontro match
+
+                            try {
+                                int score = threadEngine.Compare(fmdToVerify, 0, candidate.fmd, 0);
+                                processedCount.incrementAndGet();
+
+                                if (score < MATCH_THRESHOLD && score >= 0) {
+                                    matchFound.set(true);
+                                    VerificationResult r = new VerificationResult();
+                                    r.foundMatch = true;
+                                    r.matchedInmateId = candidate.inmateId;
+                                    r.matchedEnrollableType = candidate.enrollableType;
+                                    r.realScore = score;
+                                    r.matchScore = Math.max(0, (100000.0 - score) / 100000.0);
+                                    r.matchedMinutiae = estimateMatchedMinutiae(score);
+                                    r.matchDetails = "Coincidencia en " + candidate.fingerType;
+                                    matchRef.set(r);
+                                    return r;
+                                }
+                            } catch (Exception e) {
+                                processedCount.incrementAndGet();
+                            }
+                        }
+                        return null;
+                    }));
+                }
+
+                // Esperar resultados
+                executor.shutdown();
+                executor.awaitTermination(60, TimeUnit.SECONDS);
+                uiTimer.stop();
+
+                long compareTime = System.currentTimeMillis() - compareStart;
+                VerificationResult matchResult = matchRef.get();
+
+                // ═══════════════════════════════════════════════
+                // FASE 3: Post-proceso y resultados
+                // ═══════════════════════════════════════════════
+                if (matchResult != null && matchResult.foundMatch) {
+                    // Obtener nombre del interno (una sola query, fuera del loop)
+                    try {
+                        boolean isMatchVisitor = matchResult.matchedEnrollableType != null
+                            && matchResult.matchedEnrollableType.contains("VisitorRegistry");
+
+                        String nameQuery;
+                        if (isMatchVisitor) {
+                            nameQuery = "SELECT CONCAT(first_name, ' ', COALESCE(second_name, ''), ' ', first_surname, ' ', COALESCE(second_surname, '')) as full_name FROM visitor_registry WHERE id = ?";
+                        } else {
+                            nameQuery = "SELECT CONCAT(first_name, ' ', COALESCE(middle_name, ''), ' ', last_name, ' ', COALESCE(second_last_name, '')) as full_name FROM inmates WHERE id = ?";
+                        }
+
+                        PreparedStatement nameStmt = conn.prepareStatement(nameQuery);
+                        nameStmt.setInt(1, matchResult.matchedInmateId);
+                        ResultSet nameRs = nameStmt.executeQuery();
+                        if (nameRs.next()) {
+                            String name = nameRs.getString("full_name").trim().replaceAll("\\s+", " ");
+                            matchResult.matchedInmateName = (isMatchVisitor ? "[VISITANTE] " : "") + name;
+                        }
+                        nameRs.close();
+                        nameStmt.close();
+                    } catch (Exception nameEx) {
+                        matchResult.matchedInmateName = "ID: " + matchResult.matchedInmateId;
+                    }
+
+                    result = matchResult;
+                    result.totalComparisons = processedCount.get();
+                    result.verificationTime = System.currentTimeMillis() - startTime;
+
+                    final VerificationResult finalResult = result;
+                    final long finalCompareTime = compareTime;
+
+                    log("COINCIDENCIA! ID: " + result.matchedInmateId + ", Score: " + result.realScore +
+                        ", Threads: " + finalNThreads + ", Tiempo: " + result.verificationTime + "ms");
+
+                    SwingUtilities.invokeLater(() -> {
+                        statsArea.append("\nCOINCIDENCIA ENCONTRADA!\n");
+                        statsArea.append("----------------------------\n");
+                        if (finalResult.matchedInmateName != null && !finalResult.matchedInmateName.isEmpty() && !finalResult.matchedInmateName.startsWith("ID:")) {
+                            statsArea.append("Interno: " + finalResult.matchedInmateName + "\n");
+                            statsArea.append("ID: " + finalResult.matchedInmateId + "\n");
+                        } else {
+                            statsArea.append("ID Interno: " + finalResult.matchedInmateId + "\n");
+                        }
+                        statsArea.append("Score: " + finalResult.realScore + " (menor=mejor)\n");
+                        statsArea.append("Umbral: < " + MATCH_THRESHOLD + "\n");
+                        statsArea.append("Confianza: " + String.format("%.1f%%", finalResult.matchScore * 100) + "\n");
+                        statsArea.append("----------------------------\n");
+                        statsArea.append("Threads: " + finalNThreads + "\n");
+                        statsArea.append("Comparaciones: " + finalResult.totalComparisons + "/" + totalCandidates + "\n");
+                        statsArea.append("T. comparacion: " + finalCompareTime + " ms\n");
+                        statsArea.append("T. total: " + finalResult.verificationTime + " ms\n");
+                    });
+                } else {
+                    result.totalComparisons = processedCount.get();
+                    result.verificationTime = System.currentTimeMillis() - startTime;
+
+                    final int finalProcessed = processedCount.get();
+                    final long finalCompareTime = compareTime;
+                    final long finalTotalTime = result.verificationTime;
+
+                    SwingUtilities.invokeLater(() -> {
+                        statsArea.append("\nSin coincidencias\n");
+                        statsArea.append("----------------------------\n");
+                        statsArea.append("Comparaciones: " + finalProcessed + "\n");
+                        statsArea.append("Threads: " + finalNThreads + "\n");
+                        statsArea.append("T. comparacion: " + finalCompareTime + " ms\n");
+                        statsArea.append("T. total: " + finalTotalTime + " ms\n");
                     });
                 }
-
             }
         } catch (Exception e) {
-            log("Error en verificación: " + e.getMessage());
+            log("Error en verificacion: " + e.getMessage());
             e.printStackTrace();
 
             SwingUtilities.invokeLater(() -> {
-                statsArea.append("\n❌ Error: " + e.getMessage() + "\n");
+                statsArea.append("\nError: " + e.getMessage() + "\n");
             });
-        }
-
-        return result;
-    }
-
-    private VerificationResult verifyAgainstDatabase(byte[] template) {
-        VerificationResult result = new VerificationResult();
-
-        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPassword)) {
-            log("Conectado a base de datos");
-
-            // Obtener todas las huellas de la BD
-            String sql = "SELECT inmate_id, finger_type, fingerprint_template FROM inmate_biometric_data WHERE is_active = 1";
-            PreparedStatement stmt = conn.prepareStatement(sql);
-            ResultSet rs = stmt.executeQuery();
-
-            int count = 0;
-
-            // Crear FMD del template capturado
-            // El template ya es un FMD en formato ANSI, solo importarlo
-            Fmd searchFmd = UareUGlobal.GetImporter().ImportFmd(
-                template,
-                Fmd.Format.ANSI_378_2004,
-                Fmd.Format.ANSI_378_2004
-            );
-
-            while (rs.next()) {
-                count++;
-                int inmateId = rs.getInt("inmate_id");
-                String fingerType = rs.getString("finger_type");
-
-                // Los templates están almacenados como base64 en la BD
-                String base64Template = rs.getString("fingerprint_template");
-
-                if (base64Template != null && !base64Template.isEmpty()) {
-                    try {
-                        // Decodificar base64 a bytes
-                        byte[] storedTemplate = Base64.getDecoder().decode(base64Template);
-
-                        log("Comparando con interno " + inmateId + ", dedo: " + fingerType +
-                            ", tamaño template: " + storedTemplate.length + " bytes");
-
-                        // Debug: verificar header del template
-                        if (storedTemplate.length > 4) {
-                            String header = new String(storedTemplate, 0, 3);
-                            log("  Header del template: " + header + " (hex: " +
-                                String.format("%02X%02X%02X%02X", storedTemplate[0], storedTemplate[1],
-                                              storedTemplate[2], storedTemplate[3]) + ")");
-                        }
-
-                        // Importar FMD desde el template almacenado
-                        // Los templates están en formato ANSI 378-2004
-                        Fmd storedFmd = UareUGlobal.GetImporter().ImportFmd(
-                            storedTemplate,
-                            Fmd.Format.ANSI_378_2004,
-                            Fmd.Format.ANSI_378_2004
-                        );
-
-                        // Comparar
-                        int score = engine.Compare(searchFmd, 0, storedFmd, 0);
-
-                        // Siempre mostrar el score para debug
-                        if (score < 1000000) { // Solo mostrar scores razonables
-                            log("  Score interno " + inmateId + ", " + fingerType + ": " + score);
-                        }
-
-                        // El score de DigitalPersona es inversamente proporcional
-                        // Menor score = mejor coincidencia
-                        // Valores típicos: 0 = mismo dedo, < 10000 alta confianza, < 50000 media
-                        // Ajustamos el threshold para máxima sensibilidad durante pruebas
-                        int THRESHOLD = 200000; // Muy permisivo para detectar cualquier similitud
-
-                        if (score < THRESHOLD) {
-                            double matchPercentage = (1000000.0 - score) / 1000000.0;
-
-                            log("  ¡POSIBLE MATCH! Interno " + inmateId + ", " + fingerType +
-                                " - Score: " + score + " (" +
-                                String.format("%.2f%%", matchPercentage * 100) + " confianza)");
-
-                            if (matchPercentage > result.matchScore) {
-                                result.foundMatch = true;
-                                result.matchedInmateId = inmateId;
-                                result.matchScore = matchPercentage;
-                            }
-                        }
-
-                    } catch (UareUException e) {
-                        // Solo registrar error si es importante, no marcar como "corrupto"
-                        log("  Error al procesar template del interno " + inmateId +
-                            ", dedo " + fingerType + ": " + e.getMessage() +
-                            " (Código: " + e.getCode() + ")");
-                    } catch (Exception e) {
-                        // Otros errores
-                        log("  Error general con interno " + inmateId + ": " + e.getMessage());
-                    }
-                }
-            }
-
-            log("Verificación completada. Huellas comparadas: " + count);
-
-        } catch (Exception e) {
-            log("Error en verificación BD: " + e.getMessage());
-            e.printStackTrace();
         }
 
         return result;
@@ -1546,14 +1854,30 @@ public class VerificationApp extends JFrame {
 
     // Método para resetear la interfaz y limpiar el análisis
     private void resetInterface() {
+        // Cancelar cualquier operación en curso
+        if (currentCaptureThread != null && currentCaptureThread.isAlive()) {
+            try {
+                reader.CancelCapture();
+                currentCaptureThread.interrupt();
+                currentCaptureThread.join(500);
+            } catch (Exception e) {
+                log("Error cancelando captura durante reset: " + e.getMessage());
+            }
+        }
+
         // Limpiar template capturado
         capturedTemplate = null;
         capturedImage = null;
         originalImage = null;
         zoomLevel = 1.0;
 
+        // Resetear flags
+        isCapturing = false;
+        isVerifying = false;
+
         // Resetear controles
         verifyButton.setEnabled(false);
+        captureButton.setEnabled(true);
         qualityBar.setValue(0);
         qualityBar.setString("0%");
         qualityLabel.setText("Calidad: --");
@@ -1562,7 +1886,9 @@ public class VerificationApp extends JFrame {
 
         // Limpiar imagen de huella
         fingerImageLabel.setIcon(null);
-        fingerImageLabel.setText("Vista previa de huella");
+        fingerImageLabel.setText("Sin captura");
+        fingerImageLabel.setFont(new Font("Arial", Font.ITALIC, 14));
+        fingerImageLabel.setForeground(new Color(120, 120, 120));
         fingerImageLabel.repaint();
 
         // Limpiar panel de estadísticas
@@ -1574,47 +1900,94 @@ public class VerificationApp extends JFrame {
         statsArea.append("• Proceso de comparación\n");
         statsArea.append("• Resultados de verificación\n");
 
-        // Limpiar log
-        logArea.setText("");
         log("Interfaz reseteada - Listo para nueva captura");
     }
 
     // Método para abrir el perfil del PPL en el navegador
     private void openInmateProfile(int inmateId) {
         try {
-            // Construir URL del sistema web
-            // Asumiendo que el frontend está en localhost:5173 (Vite default)
-            // y la ruta de PPL es /inmates/{id}
-            String frontendUrl = System.getProperty("frontend.url", "http://localhost:5173");
+            log("Intentando abrir perfil del interno ID: " + inmateId);
+
+            // Leer URL del frontend desde config.properties o usar default
+            String frontendUrl = config.getProperty("frontend.url",
+                System.getProperty("frontend.url", "http://localhost:5173"));
+
             String profileUrl = frontendUrl + "/inmates/" + inmateId;
 
-            log("Abriendo perfil del PPL: " + profileUrl);
+            log("URL del perfil: " + profileUrl);
+            log("Desktop soportado: " + Desktop.isDesktopSupported());
 
-            // Verificar si Desktop es soportado
-            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
-                Desktop.getDesktop().browse(new URI(profileUrl));
+            if (Desktop.isDesktopSupported()) {
+                Desktop desktop = Desktop.getDesktop();
+                log("Desktop.Action.BROWSE soportado: " + desktop.isSupported(Desktop.Action.BROWSE));
 
-                // Mostrar mensaje de confirmación
-                JOptionPane.showMessageDialog(this,
-                    "Se ha abierto el perfil del interno ID: " + inmateId + " en su navegador.\n" +
-                    "Puede continuar con verificaciones mientras revisa el perfil.",
-                    "Perfil Abierto",
-                    JOptionPane.INFORMATION_MESSAGE);
+                if (desktop.isSupported(Desktop.Action.BROWSE)) {
+                    log("Abriendo navegador con URI: " + profileUrl);
+
+                    // IMPORTANTE: Ejecutar desktop.browse() en un thread separado
+                    // Esto evita el error "CoInitializeEx() Failed" porque el SDK de DigitalPersona
+                    // ya ha inicializado COM en el thread principal.
+                    // Desktop.browse() necesita su propia inicialización COM en un thread separado.
+                    final String finalUrl = profileUrl;
+                    new Thread(() -> {
+                        try {
+                            Desktop.getDesktop().browse(new URI(finalUrl));
+                            log("✓ Navegador abierto exitosamente");
+
+                            // Mostrar mensaje de confirmación en el EDT
+                            SwingUtilities.invokeLater(() -> {
+                                JOptionPane.showMessageDialog(VerificationApp.this,
+                                    "Se ha abierto el perfil del interno ID: " + inmateId + " en su navegador.\n\n" +
+                                    "URL: " + finalUrl + "\n\n" +
+                                    "Puede continuar con verificaciones mientras revisa el perfil.",
+                                    "Perfil Abierto",
+                                    JOptionPane.INFORMATION_MESSAGE);
+                            });
+                        } catch (Exception e) {
+                            log("ERROR abriendo navegador: " + e.getMessage());
+                            e.printStackTrace();
+                            SwingUtilities.invokeLater(() -> {
+                                JOptionPane.showMessageDialog(VerificationApp.this,
+                                    "Error al abrir el navegador:\n" + e.getMessage(),
+                                    "Error",
+                                    JOptionPane.ERROR_MESSAGE);
+                            });
+                        }
+                    }, "BrowserThread").start();
+
+                    return;
+                } else {
+                    log("ADVERTENCIA: Desktop.Action.BROWSE no soportado");
+                }
             } else {
-                // Si no se puede abrir el navegador, mostrar la URL
+                log("ADVERTENCIA: Desktop no soportado en este sistema");
+            }
+
+            // Si llegamos aquí, no se pudo abrir el navegador automáticamente
+            final String finalProfileUrl = profileUrl;
+            SwingUtilities.invokeLater(() -> {
                 JOptionPane.showMessageDialog(this,
                     "No se pudo abrir el navegador automáticamente.\n\n" +
-                    "Por favor, abra manualmente la siguiente URL:\n" +
-                    profileUrl,
+                    "Por favor, abra manualmente la siguiente URL en su navegador:\n\n" +
+                    finalProfileUrl + "\n\n" +
+                    "Puede copiar esta URL y pegarla en su navegador.",
                     "Abrir Manualmente",
                     JOptionPane.INFORMATION_MESSAGE);
-            }
+            });
+
         } catch (Exception e) {
-            log("Error abriendo perfil: " + e.getMessage());
-            JOptionPane.showMessageDialog(this,
-                "Error al abrir el perfil del interno:\n" + e.getMessage(),
-                "Error",
-                JOptionPane.ERROR_MESSAGE);
+            log("ERROR abriendo perfil: " + e.getClass().getName() + " - " + e.getMessage());
+            e.printStackTrace();
+
+            final String errorMsg = e.getMessage();
+            SwingUtilities.invokeLater(() -> {
+                JOptionPane.showMessageDialog(this,
+                    "Error al abrir el perfil del interno:\n\n" +
+                    errorMsg + "\n\n" +
+                    "Tipo de error: " + e.getClass().getSimpleName(),
+                    "Error",
+                    JOptionPane.ERROR_MESSAGE);
+            });
         }
     }
 
@@ -1666,10 +2039,31 @@ public class VerificationApp extends JFrame {
         }
     }
 
+    // Record pre-procesado listo para comparación paralela
+    private static class CandidateRecord {
+        final int inmateId; // kept for backward compat (same as enrollableId)
+        final String enrollableType; // "App\Models\Inmate\Inmate" or "App\Models\VisitorRegistry"
+        final String fingerType;
+        final Fmd fmd;  // FMD ya importado, listo para Compare()
+
+        CandidateRecord(int enrollableId, String enrollableType, String fingerType, Fmd fmd) {
+            this.inmateId = enrollableId;
+            this.enrollableType = enrollableType;
+            this.fingerType = fingerType;
+            this.fmd = fmd;
+        }
+
+        boolean isVisitor() {
+            return enrollableType != null && enrollableType.contains("VisitorRegistry");
+        }
+    }
+
     // Clase interna para resultado de verificación con más detalles
     private static class VerificationResult {
         boolean foundMatch = false;
         int matchedInmateId = 0;
+        String matchedEnrollableType = "";  // "App\Models\Inmate\Inmate" or "App\Models\VisitorRegistry"
+        String matchedInmateName = "";  // Nombre del interno/visitante coincidente
         double matchScore = 0.0;  // Porcentaje de confianza (0-1)
         int realScore = 0;        // Score real del motor (menor = mejor)
         int matchedMinutiae = 0;

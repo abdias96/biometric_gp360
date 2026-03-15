@@ -32,7 +32,7 @@ public class MainWindow extends JFrame {
     
     private void initializeServices() {
         biometricData = new BiometricData();
-        
+
         // Initialize U.are.U SDK
         try {
             captureService = new UareUCaptureService(this);
@@ -41,20 +41,19 @@ public class MainWindow extends JFrame {
             addLog("✗ Error initializing U.are.U SDK: " + e.getMessage());
             addLog("Please ensure U.are.U SDK libraries are in lib/ directory");
         }
-        
+
         apiService = new ApiService();
+        apiService.setMainWindow(this); // Enable logging to UI
         fingerprintButtons = new java.util.HashMap<>();
-        
+
         // Test API connection
         SwingUtilities.invokeLater(() -> {
             if (apiService.testConnection()) {
                 addLog("✓ Conexión API establecida");
             } else {
                 addLog("⚠ No se pudo conectar a la API - verifique el servidor Laravel");
-                String token = System.getProperty("api.token", "");
-                if (token.isEmpty()) {
-                    addLog("⚠ Token de autenticación no proporcionado");
-                }
+                addLog("⚠ Asegúrese de que Laravel esté ejecutándose en http://localhost:8000");
+                addLog("✓ Modo offline: Se guardará directamente en la base de datos");
             }
         });
     }
@@ -63,23 +62,64 @@ public class MainWindow extends JFrame {
         // Check for command line parameters or configuration
         String enrollableId = System.getProperty("enrollableId");
         String enrollableType = System.getProperty("enrollableType");
-        
+
         if (enrollableId != null) {
             biometricData.setEnrollableId(Long.parseLong(enrollableId));
+            boolean isVis = "visitor".equalsIgnoreCase(enrollableType);
+            addLog("ID de " + (isVis ? "visitante" : "interno") + " cargado desde parámetros: " + enrollableId);
+        } else {
+            // Ask user for ID if not provided
+            boolean isVis = "visitor".equalsIgnoreCase(enrollableType);
+            String entityLabel = isVis ? "Visitante" : "Interno";
+            SwingUtilities.invokeLater(() -> {
+                String inputId = JOptionPane.showInputDialog(
+                    this,
+                    "Ingrese el ID del " + entityLabel + ":",
+                    "ID de " + entityLabel + " Requerido",
+                    JOptionPane.QUESTION_MESSAGE
+                );
+
+                if (inputId != null && !inputId.trim().isEmpty()) {
+                    try {
+                        Long id = Long.parseLong(inputId.trim());
+                        biometricData.setEnrollableId(id);
+                        updateTitle();
+                        addLog("✓ ID de interno establecido: " + id);
+                    } catch (NumberFormatException e) {
+                        addLog("✗ ID inválido, debe ser un número");
+                        JOptionPane.showMessageDialog(
+                            this,
+                            "ID inválido. Por favor ingrese un número.",
+                            "Error",
+                            JOptionPane.ERROR_MESSAGE
+                        );
+                    }
+                } else {
+                    addLog("⚠ No se proporcionó ID de interno");
+                }
+            });
         }
+
         if (enrollableType != null) {
             biometricData.setEnrollableType(enrollableType);
+        } else {
+            biometricData.setEnrollableType("inmate"); // Default
         }
-        
+
         updateTitle();
     }
     
     private void updateTitle() {
-        String title = "GP360 - Captura Biométrica";
+        boolean isVisitor = "visitor".equalsIgnoreCase(biometricData.getEnrollableType());
+        String title = isVisitor ? "GP360 Biométrico - Visitante" : "GP360 - Captura Biométrica";
         if (biometricData.getEnrollableId() != null) {
             title += " - ID: " + biometricData.getEnrollableId();
         }
         setTitle(title);
+    }
+
+    public boolean isVisitorMode() {
+        return "visitor".equalsIgnoreCase(biometricData.getEnrollableType());
     }
     
     private void initializeUI() {
@@ -149,20 +189,25 @@ public class MainWindow extends JFrame {
     }
     
     private JPanel createHeaderPanel() {
+        boolean isVisitor = isVisitorMode();
+        Color headerBg = isVisitor ? new Color(21, 87, 36) : new Color(45, 45, 45);
+        Color accentColor = isVisitor ? new Color(40, 167, 69) : new Color(0, 123, 255);
+
         JPanel panel = new JPanel(new BorderLayout());
-        panel.setBackground(new Color(45, 45, 45));
+        panel.setBackground(headerBg);
         panel.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(0, 0, 2, 0, new Color(0, 123, 255)),
+            BorderFactory.createMatteBorder(0, 0, 2, 0, accentColor),
             BorderFactory.createEmptyBorder(15, 15, 15, 15)
         ));
 
         // Title panel con icono
         JPanel titlePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
-        titlePanel.setBackground(new Color(45, 45, 45));
+        titlePanel.setBackground(headerBg);
 
-        // Removed icon label for better compatibility
-
-        JLabel titleLabel = new JLabel("SISTEMA DE CAPTURA BIOMÉTRICA GP360");
+        String headerText = isVisitor
+            ? "CAPTURA BIOMÉTRICA GP360 - MODO VISITANTE"
+            : "SISTEMA DE CAPTURA BIOMÉTRICA GP360";
+        JLabel titleLabel = new JLabel(headerText);
         titleLabel.setFont(new Font("Segoe UI", Font.BOLD, 26));
         titleLabel.setForeground(Color.WHITE);
         titlePanel.add(titleLabel);
@@ -171,13 +216,12 @@ public class MainWindow extends JFrame {
 
         // Status panel
         JPanel statusPanel = new JPanel(new GridLayout(2, 2, 10, 5));
-        statusPanel.setBackground(new Color(45, 45, 45));
+        statusPanel.setBackground(headerBg);
 
-        // Authentication status
-        String authToken = System.getProperty("api.token", "");
-        JLabel authLabel = new JLabel(authToken.isEmpty() ? "[!] Sin autenticación" : "[OK] Conectado a BD", SwingConstants.RIGHT);
+        // Database status
+        JLabel authLabel = new JLabel("[OK] Modo Local (BD Directa)", SwingConstants.RIGHT);
         authLabel.setFont(new Font("Segoe UI", Font.PLAIN, 12));
-        authLabel.setForeground(authToken.isEmpty() ? new Color(255, 193, 7) : new Color(40, 167, 69));
+        authLabel.setForeground(new Color(40, 167, 69));
         statusPanel.add(authLabel);
 
         // Device status
@@ -596,13 +640,6 @@ public class MainWindow extends JFrame {
         progressBar.setValue(captured);
         progressBar.setString(captured + " de 10 huellas capturadas (" + (captured * 10) + "%)");
 
-        // Count required fingers captured
-        int requiredCaptured = 0;
-        if (biometricData.getFingerprint("right_thumb").isCaptured()) requiredCaptured++;
-        if (biometricData.getFingerprint("right_index").isCaptured()) requiredCaptured++;
-        if (biometricData.getFingerprint("left_thumb").isCaptured()) requiredCaptured++;
-        if (biometricData.getFingerprint("left_index").isCaptured()) requiredCaptured++;
-
         // Update header label with better formatting
         capturedCountLabel.setText("Capturadas: " + captured + "/10");
 
@@ -611,15 +648,19 @@ public class MainWindow extends JFrame {
             entry.getValue().updateStatus();
         }
 
-        // Enable save button when minimum required fingers are captured
-        boolean canSave = requiredCaptured >= 4;
+        // Enable save button when at least 1 fingerprint is captured
+        // (Changed from 4 required fingers to be more flexible)
+        boolean canSave = captured >= 1;
         saveButton.setEnabled(canSave);
 
         if (biometricData.isComplete()) {
             statusLabel.setText("¡COMPLETO!");
             statusLabel.setForeground(new Color(40, 167, 69));
             addLog("✓ Todas las huellas han sido capturadas exitosamente");
-        } else if (requiredCaptured >= 4) {
+        } else if (captured >= 4) {
+            statusLabel.setText("CANTIDAD RECOMENDADA");
+            statusLabel.setForeground(new Color(40, 167, 69));
+        } else if (captured >= 1) {
             statusLabel.setText("MÍNIMO ALCANZADO");
             statusLabel.setForeground(new Color(255, 193, 7));
         } else {
@@ -676,27 +717,29 @@ public class MainWindow extends JFrame {
     }
     
     private void saveToDatabase() {
-        if (!biometricData.isComplete()) {
-            StringBuilder missing = new StringBuilder("Debe capturar los siguientes dedos requeridos:\n\n");
-            if (!biometricData.getFingerprint("right_thumb").isCaptured()) {
-                missing.append("• Pulgar Derecho\n");
-            }
-            if (!biometricData.getFingerprint("right_index").isCaptured()) {
-                missing.append("• Índice Derecho\n");
-            }
-            if (!biometricData.getFingerprint("left_thumb").isCaptured()) {
-                missing.append("• Pulgar Izquierdo\n");
-            }
-            if (!biometricData.getFingerprint("left_index").isCaptured()) {
-                missing.append("• Índice Izquierdo\n");
-            }
-            missing.append("\nEstos 4 dedos son obligatorios para el registro.");
-            
+        // Verificar mínimo requerido (al menos 1 huella capturada)
+        if (biometricData.getCapturedCount() < 1) {
             JOptionPane.showMessageDialog(this,
-                missing.toString(),
+                "Debe capturar al menos 1 huella dactilar.\n\n" +
+                "Nota: Se recomienda capturar 4 o más huellas para mejor identificación.",
                 "Captura incompleta",
                 JOptionPane.WARNING_MESSAGE);
             return;
+        }
+
+        // Advertencia si hay menos de 4 huellas (recomendación)
+        if (biometricData.getCapturedCount() < 4) {
+            int response = JOptionPane.showConfirmDialog(this,
+                "Solo se han capturado " + biometricData.getCapturedCount() + " huella(s).\n\n" +
+                "Se recomienda capturar al menos 4 huellas para mejor identificación.\n\n" +
+                "¿Desea continuar guardando con esta cantidad de huellas?",
+                "Advertencia - Pocas Huellas",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE);
+
+            if (response != JOptionPane.YES_OPTION) {
+                return;
+            }
         }
         
         statusLabel.setText("Guardando...");
@@ -706,7 +749,14 @@ public class MainWindow extends JFrame {
         SwingWorker<Boolean, Void> worker = new SwingWorker<>() {
             @Override
             protected Boolean doInBackground() throws Exception {
-                return apiService.saveBiometricData(biometricData);
+                // Try direct database save first (for local development)
+                // Falls back to API if database is not accessible
+                boolean success = apiService.saveDirectToDatabase(biometricData);
+                if (!success) {
+                    addLog("Direct database save failed, trying API...");
+                    success = apiService.saveBiometricData(biometricData);
+                }
+                return success;
             }
             
             @Override
