@@ -403,26 +403,19 @@ public class ApiService {
                     log("[BD] Desactivados " + updated + " registros en biometric_data");
                 }
 
-                // Also deactivate in legacy table for inmates
-                if (!isVisitor) {
-                    String deactivateSql = "UPDATE inmate_biometric_data SET is_active = 0 WHERE inmate_id = ?";
-                    try (java.sql.PreparedStatement pstmt = conn.prepareStatement(deactivateSql)) {
-                        pstmt.setLong(1, biometricData.getEnrollableId());
-                        int updated = pstmt.executeUpdate();
-                        log("[BD] Desactivados " + updated + " registros en inmate_biometric_data (legacy)");
-                    }
-                }
+                // Note: inmate_biometric_data is now a VIEW pointing to biometric_data
+                // No separate deactivation needed
 
-                // === UNIFIED biometric_data TABLE ===
+                // === biometric_data TABLE (renamed from inmate_biometric_data) ===
                 String unifiedSql = "INSERT INTO biometric_data " +
-                           "(enrollable_id, enrollable_type, finger_type, fingerprint_template, iso_template, wsq_image, " +
+                           "(inmate_id, enrollable_id, enrollable_type, finger_type, fingerprint_template, iso_template, wsq_image, " +
                            "fingerprint_quality, nist_quality_score, minutiae_count, wsq_compression_ratio, wsq_bitrate, " +
                            "fingerprint_image, image_width, image_height, image_dpi, " +
                            "template_size, sdk_version, enrollment_samples, " +
                            "capture_date, capture_device, is_active, captured_by, " +
                            "template_format, iso_compliant, fbi_compliant, nist_compliant, " +
                            "created_at, updated_at) " +
-                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURDATE(), 'DigitalPersona U.are.U 4500', 1, ?, 'ANSI_378_2004', TRUE, ?, TRUE, NOW(), NOW()) " +
+                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURDATE(), 'DigitalPersona U.are.U 4500', 1, ?, 'ANSI_378_2004', TRUE, ?, TRUE, NOW(), NOW()) " +
                            "ON DUPLICATE KEY UPDATE " +
                            "fingerprint_template = VALUES(fingerprint_template), " +
                            "iso_template = VALUES(iso_template), " +
@@ -459,6 +452,12 @@ public class ApiService {
                             if (templateData == null || templateData.length < 26) continue;
 
                             int idx = 1;
+                            // inmate_id: set for inmates, null for visitors
+                            if (!isVisitor) {
+                                unifiedPstmt.setLong(idx++, biometricData.getEnrollableId()); // inmate_id
+                            } else {
+                                unifiedPstmt.setNull(idx++, java.sql.Types.BIGINT); // inmate_id = null for visitors
+                            }
                             unifiedPstmt.setLong(idx++, biometricData.getEnrollableId()); // enrollable_id
                             unifiedPstmt.setString(idx++, morphType); // enrollable_type
                             unifiedPstmt.setString(idx++, fingerType); // finger_type
@@ -539,204 +538,11 @@ public class ApiService {
                     }
                 }
 
-                // === LEGACY inmate_biometric_data TABLE (only for inmates) ===
-                if (isVisitor) {
-                    conn.commit();
-                    log("[BD] ✓ Commit exitoso (visitante - solo tabla unificada)");
-                    return true;
-                }
-
-                // Insert into inmate_biometric_data table with ALL available fields
-                // The UNIQUE constraint (inmate_id, finger_type) will handle duplicates automatically
-                String sql = "INSERT INTO inmate_biometric_data " +
-                           "(inmate_id, finger_type, fingerprint_template, iso_template, wsq_image, " +
-                           "fingerprint_quality, nist_quality_score, minutiae_count, wsq_compression_ratio, wsq_bitrate, " +
-                           "fingerprint_image, image_width, image_height, image_dpi, " +
-                           "template_size, sdk_version, enrollment_samples, " +
-                           "capture_date, capture_device, is_active, captured_by, " +
-                           "template_format, iso_compliant, fbi_compliant, nist_compliant, " +
-                           "created_at, updated_at) " +
-                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURDATE(), 'DigitalPersona U.are.U 4500', 1, ?, 'ANSI_378_2004', TRUE, ?, TRUE, NOW(), NOW()) " +
-                           "ON DUPLICATE KEY UPDATE " +
-                           "fingerprint_template = VALUES(fingerprint_template), " +
-                           "iso_template = VALUES(iso_template), " +
-                           "wsq_image = VALUES(wsq_image), " +
-                           "fingerprint_quality = VALUES(fingerprint_quality), " +
-                           "nist_quality_score = VALUES(nist_quality_score), " +
-                           "minutiae_count = VALUES(minutiae_count), " +
-                           "wsq_compression_ratio = VALUES(wsq_compression_ratio), " +
-                           "wsq_bitrate = VALUES(wsq_bitrate), " +
-                           "fingerprint_image = VALUES(fingerprint_image), " +
-                           "image_width = VALUES(image_width), " +
-                           "image_height = VALUES(image_height), " +
-                           "image_dpi = VALUES(image_dpi), " +
-                           "template_size = VALUES(template_size), " +
-                           "sdk_version = VALUES(sdk_version), " +
-                           "enrollment_samples = VALUES(enrollment_samples), " +
-                           "capture_date = VALUES(capture_date), " +
-                           "capture_device = VALUES(capture_device), " +
-                           "is_active = 1, " +
-                           "iso_compliant = VALUES(iso_compliant), " +
-                           "fbi_compliant = VALUES(fbi_compliant), " +
-                           "nist_compliant = VALUES(nist_compliant), " +
-                           "updated_at = NOW()";
-
-                try (java.sql.PreparedStatement pstmt = conn.prepareStatement(sql)) {
-                    int count = 0;
-                    for (Fingerprint fp : biometricData.getFingerprints().values()) {
-                        if (fp.isCaptured()) {
-                            // Map finger position to database enum
-                            String fingerType = fp.getPosition();
-                            if (fingerType.endsWith("_little")) {
-                                fingerType = fingerType.replace("_little", "_pinky");
-                            }
-
-                            // Validate template before saving
-                            byte[] templateData = fp.getTemplateData();
-                            if (templateData == null || templateData.length < 26) {
-                                log("[BD] Warning: Invalid template for " + fingerType + " (null or < 26 bytes), skipping");
-                                continue;
-                            }
-
-                            // 1. inmate_id
-                            pstmt.setLong(1, biometricData.getEnrollableId());
-
-                            // 2. finger_type
-                            pstmt.setString(2, fingerType);
-
-                            // 3. fingerprint_template (ANSI 378-2004 format) - Base64 encoded
-                            pstmt.setString(3, Base64.getEncoder().encodeToString(templateData));
-
-                            // 4. iso_template (ISO 19794-2 format via SDK ImportFmd) - Base64 encoded
-                            String isoTemplate = convertToISO19794(fp);
-                            pstmt.setString(4, isoTemplate);
-
-                            // 5. wsq_image - Try to convert to WSQ if image data is available
-                            Double compressionRatio = null;
-                            String wsqData = null;
-
-                            if (fp.getImageData() != null && fp.getImageData().length > 0) {
-                                wsqData = convertToWSQ(fp);
-                                if (wsqData != null) {
-                                    pstmt.setString(5, wsqData);
-                                    byte[] wsqBytes = Base64.getDecoder().decode(wsqData);
-                                    compressionRatio = (double) fp.getImageData().length / wsqBytes.length;
-                                } else {
-                                    pstmt.setNull(5, java.sql.Types.LONGVARCHAR);
-                                }
-                            } else {
-                                pstmt.setNull(5, java.sql.Types.LONGVARCHAR);
-                            }
-
-                            // 6. fingerprint_quality (0-100) - real value from SDK
-                            pstmt.setInt(6, fp.getQualityScore());
-
-                            // 7. nist_quality_score (1-5, where 1=excellent)
-                            String nistScore = convertQualityToNIST(fp.getQualityScore());
-                            pstmt.setString(7, nistScore);
-
-                            // 8. minutiae_count - real value from SDK Fmv.getMinutiaCnt()
-                            pstmt.setInt(8, fp.getMinutiaeCount());
-
-                            // 9. wsq_compression_ratio
-                            if (compressionRatio != null) {
-                                pstmt.setDouble(9, compressionRatio);
-                            } else {
-                                pstmt.setNull(9, java.sql.Types.DECIMAL);
-                            }
-
-                            // 10. wsq_bitrate (0.75 = 15:1 compression)
-                            if (wsqData != null) {
-                                pstmt.setInt(10, 750);
-                            } else {
-                                pstmt.setNull(10, java.sql.Types.INTEGER);
-                            }
-
-                            // 11. fingerprint_image (PNG in base64)
-                            if (fp.getImageData() != null && fp.getImageData().length > 0) {
-                                pstmt.setString(11, Base64.getEncoder().encodeToString(fp.getImageData()));
-                            } else {
-                                pstmt.setNull(11, java.sql.Types.LONGVARCHAR);
-                            }
-
-                            // 12-13. image_width, image_height
-                            if (fp.getImageData() != null && fp.getImageData().length > 0) {
-                                try {
-                                    java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(fp.getImageData());
-                                    java.awt.image.BufferedImage img = javax.imageio.ImageIO.read(bais);
-                                    if (img != null) {
-                                        pstmt.setInt(12, img.getWidth());
-                                        pstmt.setInt(13, img.getHeight());
-                                    } else {
-                                        pstmt.setInt(12, 320);
-                                        pstmt.setInt(13, 400);
-                                    }
-                                } catch (Exception e) {
-                                    pstmt.setInt(12, 320);
-                                    pstmt.setInt(13, 400);
-                                }
-                            } else {
-                                pstmt.setNull(12, java.sql.Types.INTEGER);
-                                pstmt.setNull(13, java.sql.Types.INTEGER);
-                            }
-
-                            // 14. image_dpi - U.are.U 4500 = 500 DPI fixed
-                            pstmt.setInt(14, 500);
-
-                            // 15. template_size (size in bytes)
-                            pstmt.setInt(15, templateData.length);
-
-                            // 16. sdk_version
-                            pstmt.setString(16, "DigitalPersona U.are.U SDK 2.2.2");
-
-                            // 17. enrollment_samples (4 captures per finger by SDK design)
-                            pstmt.setInt(17, 4);
-
-                            // 18. captured_by
-                            String capturedByStr = System.getProperty("capturedByUserId",
-                                config.getProperty("user.id",
-                                config.getProperty("captured_by", "1")));
-                            int capturedByUserId = 1;
-                            try {
-                                capturedByUserId = Integer.parseInt(capturedByStr);
-                            } catch (NumberFormatException e) {
-                                log("[BD] Warning: Invalid user ID '" + capturedByStr + "', using default: 1");
-                            }
-                            log("[BD] Usuario capturador (captured_by): " + capturedByUserId);
-                            pstmt.setInt(18, capturedByUserId);
-
-                            // 19. fbi_compliant (true if WSQ was created successfully)
-                            pstmt.setBoolean(19, wsqData != null);
-
-                            pstmt.addBatch();
-                            count++;
-
-                            // Log detailed information
-                            String wsqStatus = wsqData != null ? "OK" : "N/A";
-                            int imageSize = (fp.getImageData() != null) ? fp.getImageData().length : 0;
-                            String compressionInfo = compressionRatio != null ?
-                                String.format("%.1f:1", compressionRatio) : "N/A";
-
-                            log(String.format("[BD] Prepared: %s (Quality: %d%%, NIST: %s, Minutiae: %d, Template: %d bytes, Image: %d KB, WSQ: %s, ISO: %s)",
-                                fingerType,
-                                fp.getQualityScore(),
-                                nistScore,
-                                fp.getMinutiaeCount(),
-                                templateData.length,
-                                imageSize / 1024,
-                                wsqStatus,
-                                isoTemplate != null ? "OK" : "N/A"));
-                        }
-                    }
-
-                    log("[BD] Ejecutando batch de " + count + " huellas...");
-                    int[] results = pstmt.executeBatch();
-                    log("[BD] ✓ Batch ejecutado, filas afectadas: " + results.length);
-
-                    conn.commit();
-                    log("[BD] ✓ Commit exitoso");
-                    return true;
-                }
+                // biometric_data IS the renamed inmate_biometric_data table
+                // No separate legacy insert needed
+                conn.commit();
+                log("[BD] ✓ Commit exitoso");
+                return true;
             }
         } catch (ClassNotFoundException e) {
             log("[BD] ✗ ERROR: No se encontró el driver MySQL: " + e.getMessage());
